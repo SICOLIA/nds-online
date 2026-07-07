@@ -73,6 +73,12 @@ cmake_dependent_option(ENABLE_JIT_PROFILING "Enable JIT profiling with VTune" OF
 option(ENABLE_OGLRENDERER "Enable OpenGL renderer" OFF)
 option(WEBGL_COMPATIBILITY_ENABLED "Enable WebGL support" ON)
 
+# ─── WASM高速化: SIMD + 最大最適化 ───
+if (EMSCRIPTEN)
+    add_compile_options(-msimd128 -O3 -ffast-math)
+    add_link_options(-msimd128 -O3)
+endif()
+
 check_ipo_supported(RESULT IPO_SUPPORTED)
 cmake_dependent_option(ENABLE_LTO_RELEASE "Enable link-time optimizations for release builds" ON "IPO_SUPPORTED" OFF)
 cmake_dependent_option(ENABLE_LTO "Enable link-time optimizations" OFF "IPO_SUPPORTED" OFF)
