@@ -190,26 +190,11 @@
         topScreen: null,
         bottomScreen: null
       },
-      // Cached 2D contexts + reusable ImageData buffers so frameUpdate() doesn't hit the DOM
-      // or allocate a new ImageData 60x/sec.
-      emulatorCanvasCache: {
-        topCtx: null,
-        bottomCtx: null,
-        topImageData: null,
-        bottomImageData: null
-      },
       emulatorScreenTouching: false,
       emulatorButtonInput: 0,
       emulatorFirmwareSettings: null,
-      // Holds the requestAnimationFrame handle (previously a setInterval id).
       emulatorFrameInterval: null,
-      // ms per emulated NDS frame (~59.826Hz in reality, we approximate 60Hz here). Adjusted by
-      // setEmulatorSpeed() for fast-forward.
       emulatorFrameSpeed: 1000 / 60,
-      // Accumulates real elapsed time between rAF callbacks so we step the correct number of NDS
-      // frames regardless of the display's actual refresh rate (60Hz, 120Hz, throttled, etc).
-      emulatorFrameAccumulator: 0,
-      emulatorLastFrameTimestamp: null,
       emulatorRumble: false,
       emulatorUsingGamepad: false,
       events: {
@@ -233,9 +218,9 @@
           WebMelon._internal.subscribers = DefaultSubscribers;
           // Call old shutdown listeners
           callAllSubscribers(shutdownListeners);
-          // Stop emulator frame loop and reset state
+          // Stop emulator interval and reset state
           if (WebMelon._internal.emulatorFrameInterval) {
-            cancelAnimationFrame(WebMelon._internal.emulatorFrameInterval);
+            clearInterval(WebMelon._internal.emulatorFrameInterval);
           }
           WebMelon._internal.emulatorAudioCtx.close();
           WebMelon._internal.emulatorAudioNode = null;
@@ -244,15 +229,7 @@
             sampleRate: 32823
           });
           WebMelon._internal.emulatorFrameSpeed = 1000 / 60;
-          WebMelon._internal.emulatorFrameInterval = null;
-          WebMelon._internal.emulatorFrameAccumulator = 0;
-          WebMelon._internal.emulatorLastFrameTimestamp = null;
-          WebMelon._internal.emulatorCanvasCache = {
-            topCtx: null,
-            bottomCtx: null,
-            topImageData: null,
-            bottomImageData: null
-          };
+          WebMelon._internal.emulatorFrameInterval = 1000 / 60;
           WebMelon._internal.emulatorAudioQueue.left = new Int16Array(8192);
           WebMelon._internal.emulatorAudioQueue.right = new Int16Array(8192);
           WebMelon._internal.emulator = null;
@@ -559,7 +536,8 @@
         },
         frameUpdate: () => {
           let emulator = WebMelon._internal.emulator;
-          let cache = WebMelon._internal.emulatorCanvasCache;
+          let topCtx = document.getElementById(WebMelon._internal.emulatorElements.topScreen).getContext('2d');
+          let bottomCtx = document.getElementById(WebMelon._internal.emulatorElements.bottomScreen).getContext('2d');
           let audioQueue = WebMelon._internal.emulatorAudioQueue;
 
           try {
@@ -571,13 +549,13 @@
             let spuOutputArray = new Int16Array(Module.HEAPU8.buffer, audioBufferPtr, audioSamples * 2);
             let topScreenArray = new Uint8Array(Module.HEAPU8.buffer, topScreenPtr, 256 * 192 * 4);
             let bottomScreenArray = new Uint8Array(Module.HEAPU8.buffer, bottomScreenPtr, 256 * 192 * 4);
+            let topDataImage = topCtx.createImageData(256, 192);
+            let bottomDataImage = bottomCtx.createImageData(256, 192);
 
-            // Contexts + ImageData are created once in startEmulation() and reused here instead of
-            // being looked up / allocated fresh every frame.
-            cache.topImageData.data.set(topScreenArray);
-            cache.bottomImageData.data.set(bottomScreenArray);
-            cache.topCtx.putImageData(cache.topImageData, 0, 0);
-            cache.bottomCtx.putImageData(cache.bottomImageData, 0, 0);
+            topDataImage.data.set(topScreenArray);
+            bottomDataImage.data.set(bottomScreenArray);
+            topCtx.putImageData(topDataImage, 0, 0);
+            bottomCtx.putImageData(bottomDataImage, 0, 0);
 
             if (audioSamples !== 0) {
               const audioNode = WebMelon._internal.emulatorAudioNode;
@@ -675,7 +653,6 @@
         WebMelon._internal.emulatorElements.bottomScreen = bottomScreenCanvasId;
         WebMelon._internal.emulator.initialize(!WebMelon._internal.firmwareSettings.shouldFirmwareBoot);
         const touchScreen = document.getElementById(WebMelon._internal.emulatorElements.bottomScreen);
-        const topScreen = document.getElementById(WebMelon._internal.emulatorElements.topScreen);
         touchScreen.addEventListener('mousedown', WebMelon.emulator._eventListeners.mouseDown);
         touchScreen.addEventListener('mousemove', WebMelon.emulator._eventListeners.mouseMove);
         touchScreen.addEventListener('mouseup', WebMelon.emulator._eventListeners.mouseUp);
@@ -684,56 +661,10 @@
         window.addEventListener('keydown', WebMelon.emulator._eventListeners.keyDown);
         window.addEventListener('keyup', WebMelon.emulator._eventListeners.keyUp);
         WebMelon.audio.createAudioProcessor();
-
-        // { alpha: false } lets the browser skip alpha-blending the canvas against whatever is
-        // behind it, since the NDS framebuffer is always fully opaque. Small win, but free.
-        const topCtx = topScreen.getContext('2d', { alpha: false });
-        const bottomCtx = touchScreen.getContext('2d', { alpha: false });
-        WebMelon._internal.emulatorCanvasCache = {
-          topCtx,
-          bottomCtx,
-          topImageData: topCtx.createImageData(256, 192),
-          bottomImageData: bottomCtx.createImageData(256, 192)
-        };
-
-        WebMelon._internal.emulatorFrameAccumulator = 0;
-        WebMelon._internal.emulatorLastFrameTimestamp = null;
-        WebMelon._internal.emulatorFrameInterval = requestAnimationFrame(WebMelon.emulator._runFrameLoop);
-      },
-      /**
-       * Drives emulation via requestAnimationFrame instead of setInterval. Using rAF keeps frame
-       * pacing synced to the browser's actual paint cycle (no drift/jank from timer throttling),
-       * and a time accumulator steps the correct number of NDS frames regardless of the display's
-       * refresh rate (60Hz, 120Hz, a throttled background tab, etc), rather than assuming exactly
-       * one NDS frame per callback.
-       *
-       * @param {number} timestamp supplied automatically by requestAnimationFrame
-       */
-      _runFrameLoop: (timestamp) => {
-        const internal = WebMelon._internal;
-
-        if (internal.emulatorLastFrameTimestamp === null) {
-          internal.emulatorLastFrameTimestamp = timestamp;
-        }
-
-        let elapsed = timestamp - internal.emulatorLastFrameTimestamp;
-        internal.emulatorLastFrameTimestamp = timestamp;
-
-        // If the tab was backgrounded/throttled, don't try to catch up hundreds of frames at
-        // once when it becomes active again - cap how far behind we're willing to "catch up".
-        const maxCatchUpMs = internal.emulatorFrameSpeed * 4;
-        if (elapsed > maxCatchUpMs) {
-          elapsed = maxCatchUpMs;
-        }
-
-        internal.emulatorFrameAccumulator += elapsed;
-
-        while (internal.emulatorFrameAccumulator >= internal.emulatorFrameSpeed) {
-          WebMelon.emulator.runFrame();
-          internal.emulatorFrameAccumulator -= internal.emulatorFrameSpeed;
-        }
-
-        internal.emulatorFrameInterval = requestAnimationFrame(WebMelon.emulator._runFrameLoop);
+        WebMelon._internal.emulatorFrameInterval = setInterval(
+          WebMelon.emulator.runFrame,
+          WebMelon._internal.emulatorFrameSpeed
+        );
       },
       setSavePath: (pathname) => {
         WebMelon._internal.emulator.setSavePath(pathname);
@@ -770,25 +701,25 @@
           throw new Error('Cannot pause while emulator does not exist!');
         }
         WebMelon._internal.emulatorAudioCtx.suspend();
-        cancelAnimationFrame(WebMelon._internal.emulatorFrameInterval);
+        clearInterval(WebMelon._internal.emulatorFrameInterval);
       },
       resume: () => {
         if (!WebMelon._internal.emulator) {
           throw new Error('Cannot resume while emulator does not exist!');
         }
         WebMelon._internal.emulatorAudioCtx.resume();
-        // Reset pacing state so the (potentially long) pause isn't treated as elapsed time to
-        // catch up on.
-        WebMelon._internal.emulatorFrameAccumulator = 0;
-        WebMelon._internal.emulatorLastFrameTimestamp = null;
-        WebMelon._internal.emulatorFrameInterval = requestAnimationFrame(WebMelon.emulator._runFrameLoop);
+        WebMelon._internal.emulatorFrameInterval = setInterval(
+          WebMelon.emulator.runFrame,
+          WebMelon._internal.emulatorFrameSpeed
+        );
       },
       setEmulatorSpeed: (multiplier) => {
-        cancelAnimationFrame(WebMelon._internal.emulatorFrameInterval);
+        clearInterval(WebMelon._internal.emulatorFrameInterval);
         WebMelon._internal.emulatorFrameSpeed = 1000 / (60 * multiplier);
-        WebMelon._internal.emulatorFrameAccumulator = 0;
-        WebMelon._internal.emulatorLastFrameTimestamp = null;
-        WebMelon._internal.emulatorFrameInterval = requestAnimationFrame(WebMelon.emulator._runFrameLoop);
+        WebMelon._internal.emulatorFrameInterval = setInterval(
+          WebMelon.emulator.runFrame,
+          WebMelon._internal.emulatorFrameSpeed
+        );
       }
     },
     firmware: {
